@@ -1,5 +1,2 @@
 # --- The Coupled Pair (Target + Blocker) ---
 pydantic==2.4.0
-
-# --- A Standard Lib to keep them company ---
-typing-extensions==4.8.0
