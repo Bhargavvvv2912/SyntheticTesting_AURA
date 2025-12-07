@@ -1,0 +1,62 @@
+name: AURA Synthetic Lab Test
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  test-aura:
+    runs-on: ubuntu-latest
+    
+    defaults:
+      run:
+        working-directory: ${{ github.workspace }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Free Disk Space (Just in case)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Agent Dependencies
+        run: |
+          python -m pip install google-generativeai pypi-simple packaging pip-tools
+
+      - name: Run AURA Agent (Unbuffered)
+        # -u is important to see logs in real-time
+        run: python -u dependency_agent.py
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+      - name: Cleanup Agent Artifacts
+        run: rm -rf temp_venv final_venv bootstrap_venv temp_pip_check initial_check_venv temp_co_res_venv
+
+      - name: Commit Results (If Changed)
+        run: |
+          git config --global user.name 'AURA Agent'
+          git config --global user.email 'aura@bot.com'
+          
+          git add requirements.txt
+          
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          
+          git commit -m "chore: AURA updated dependencies [skip ci]"
+          git push
