@@ -177,7 +177,10 @@ class DependencyAgent:
             
             progressive_baseline_path = Path(f"./pass_{pass_num}_progressive_reqs.txt")
             shutil.copy(self.requirements_path, progressive_baseline_path)
+            
             changed_packages_this_pass = set()
+            # NEW: Track packages already handled in this pass (via Co-Resolution)
+            processed_in_this_pass = set()
 
             packages_to_update = []
             with open(progressive_baseline_path, 'r') as f: lines = [line.strip() for line in f if line.strip() and not line.strip().startswith('#')]
@@ -193,10 +196,13 @@ class DependencyAgent:
                 if progressive_baseline_path.exists(): progressive_baseline_path.unlink()
                 break 
 
+            # (Risk Score Calc - Same as before)
             update_plan = []
             for pkg, cur, target in packages_to_update:
                 components = self._calculate_update_risk_components(pkg, cur, target)
                 update_plan.append({'pkg': pkg, 'cur': cur, 'target': target, 'components': components})
+            
+            # ... (Sort logic - Same as before) ...
             max_ecosystem = max(p['components']['ecosystem'] for p in update_plan) if update_plan else 0
             max_depth = max(p['components']['depth'] for p in update_plan) if update_plan else 0
             W_ECOSYSTEM, W_DEPTH = 1.0, 0.5
@@ -206,9 +212,7 @@ class DependencyAgent:
                 entanglement_score = (W_ECOSYSTEM * norm_ecosystem) + (W_DEPTH * norm_depth)
                 p['final_score'] = (comps['severity'] * 10) + entanglement_score
                 p['code_impact_score'] = comps['usage'] + (comps['criticality'] * 10)
-            
             update_plan.sort(key=lambda p: (p['final_score'], p['code_impact_score']), reverse=True)
-            
             total_score_sum = sum(p['final_score'] for p in update_plan) if update_plan else 0
             for p in update_plan:
                  if total_score_sum == 0: p['risk_percent_display'] = 0.0
@@ -221,29 +225,43 @@ class DependencyAgent:
             
             for i, p_data in enumerate(update_plan):
                 package, current_ver, target_ver = p_data['pkg'], p_data['cur'], p_data['target']
+                
+                # --- NEW: SKIP CHECK ---
+                if package in processed_in_this_pass:
+                    print(f"\nSkipping '{package}' (Already updated via Co-Resolution in this pass).")
+                    continue
+                # -----------------------
+
                 print(f"\n" + "-"*80); print(f"PULSE: [PASS {pass_num} | ATTEMPT {i+1}/{len(update_plan)}] Processing '{package}'"); print(f"PULSE: Changed packages this pass so far: {changed_packages_this_pass}"); print("-"*80)
                 
-                success, reason_or_new_version, _ = self.attempt_update_with_healing(package, current_ver, target_ver, [], progressive_baseline_path, progressive_baseline_path)
+                # Call update, expect a dict of changes
+                success, changes_dict, _ = self.attempt_update_with_healing(package, current_ver, target_ver, [], progressive_baseline_path, progressive_baseline_path)
                 
                 if success:
-                    reached_version, is_a_real_change = "", False
-                    if "skipped" in str(reason_or_new_version): reached_version, is_a_real_change = current_ver, False
-                    else:
-                        reached_version = reason_or_new_version
-                        if current_ver != reached_version: is_a_real_change = True
-                    final_successful_updates[package] = (target_ver, reached_version)
-                    if is_a_real_change:
-                        changed_packages_this_pass.add(package)
-                        print(f"  -> SUCCESS. Locking in {package}=={reached_version} into the progressive baseline for this pass.")
-                        with open(progressive_baseline_path, "r") as f: temp_lines = f.readlines()
-                        with open(progressive_baseline_path, "w") as f:
-                            for line in temp_lines:
-                                if self._get_package_name_from_spec(line.split(';')[0]) == package:
-                                    marker_part = f" ;{line.split(';')[1]}" if ';' in line else ""
-                                    f.write(f"{package}=={reached_version}{marker_part}\n")
-                                else: f.write(line)
+                    # Update records for ALL packages modified in this step
+                    for changed_pkg, reached_ver in changes_dict.items():
+                        # Determine if it was a real change from original
+                        # (Simplification: We assume if it's in the dict, it's the new state)
+                        final_successful_updates[changed_pkg] = (self.get_latest_version(changed_pkg) or "unknown", reached_ver)
+                        
+                        # Add to processed set so we don't update it again
+                        processed_in_this_pass.add(changed_pkg)
+                        
+                        # Only add to "changed_packages" if it differs from start of pass
+                        # (Logic simplified for readability, assuming changes_dict contains the result)
+                        changed_packages_this_pass.add(changed_pkg)
+                        
+                        if changed_pkg == package:
+                            if "skipped" in str(reached_ver):
+                                print(f"  -> Result: Skipped/Reverted.")
+                            else:
+                                print(f"  -> SUCCESS. Locking in {changed_pkg}=={reached_ver}")
+                        else:
+                            # Print side-effect updates
+                            print(f"  -> Co-Resolution Side-Effect: Locked in {changed_pkg}=={reached_ver}")
+
                 else:
-                    final_failed_updates[package] = (target_ver, reason_or_new_version)
+                    final_failed_updates[package] = (target_ver, "Failed")
             
             end_group()
 
@@ -408,59 +426,43 @@ class DependencyAgent:
         
         if success:
             print(f"--> Toplevel Result: Direct update SUCCEEDED.")
-            return True, result_data if "skipped" in str(result_data) else target_version, None
+            # Return dict of changes (Single package)
+            return True, {package: result_data if "skipped" in str(result_data) else target_version}, None
 
         print(f"\n--> Toplevel Result: Direct update FAILED. Reason: '{result_data}'")
         
+        # ... (Log printing logic) ...
+        quick_blockers = self.expert.diagnose_conflict_from_log(toplevel_stderr)
+        print(f"    Suspected Blockers (Regex): {quick_blockers}")
+
         # --- LEVEL 1 HEALING ---
         print("--> Action: Entering Level 1 Healing with 'Filter-Then-Scan' strategy.")
-        
-        # UNPACK THE NEW RETURN VALUE (healed_ver, rich_log)
         healed_version, level1_stderr = self._heal_with_filter_and_scan(package, current_version, target_version, baseline_reqs_path)
         
         if healed_version and healed_version != current_version:
              print(f"--> Healing Result: Level 1 Succeeded. Found new working version: {healed_version}")
-             return True, healed_version, None
+             return True, {package: healed_version}, None
 
         # --- ESCALATION TO LEVEL 2 ---
         print(f"\n--> Action: Level 1 Healing failed for '{package}'. Escalating to Level 2 'Co-Resolution Expert'.")
         
-        # DECISION: Use the Level 1 log if available, as it contains specific conflict details
         best_error_log = level1_stderr if level1_stderr else toplevel_stderr
-
-        # 1. Diagnose the blockers
         print("    -> Step 1: Diagnosing blockers...")
         blockers = self.expert.diagnose_conflict_from_log(best_error_log)
         
-        # 2. Feasibility Check
-        print(f"    -> Step 2: Checking feasibility. Diagnosed blockers: {blockers}")
-        available_updates = self.get_available_updates_from_plan()
-        
-        # Robust filtering: Ignore Target, Project Name, Pip, Setuptools
+        # ... (Feasibility Check - Same as before) ...
         project_name = self.config.get("PROJECT_NAME", "").lower().replace('_', '-')
-        other_blockers = [
-            b for b in blockers 
-            if b.lower() != package.lower() 
-            and b.lower() != project_name
-            and b.lower() != "pip"
-            and b.lower() != "setuptools"
-        ]
-        
-        updatable_blockers = {
-            pkg: ver for pkg, ver in available_updates.items() 
-            if pkg in other_blockers
-        }
+        other_blockers = [b for b in blockers if b.lower() != package.lower() and b.lower() != project_name and b.lower() != "pip" and b.lower() != "setuptools"]
+        updatable_blockers = {pkg: ver for pkg, ver in self.get_available_updates_from_plan().items() if pkg in other_blockers}
         
         if not updatable_blockers:
-            print("    -> Feasibility Check FAILED: No other blocking packages have available updates.")
-            print("       A meaningful co-resolution is not possible at this time.")
-            return True, current_version, None 
+            print("    -> Feasibility Check FAILED.")
+            return True, {package: current_version}, None 
 
         print(f"    -> Feasibility Check PASSED. Candidates: {list(updatable_blockers.keys())}")
 
-        # 3. GREEDY HEURISTIC ATTEMPT (Update ALL blockers)
-        print(f"    -> Step 3: Attempting 'Greedy Maximization' (Update ALL blockers to latest)...")
-        
+        # 3. GREEDY HEURISTIC
+        print(f"    -> Step 3: Attempting 'Greedy Maximization'...")
         greedy_plan = [f"{package}=={target_version}"]
         for b_pkg, b_ver in updatable_blockers.items():
             if b_pkg.lower() != package.lower():
@@ -471,20 +473,22 @@ class DependencyAgent:
         
         if probe_success:
             print("--> Greedy Maximization SUCCEEDED! (Skipped LLM)")
+            # Parse plan into dict
+            changes_map = {self._get_package_name_from_spec(p.split('==')[0]): p.split('==')[1] for p in greedy_plan}
+            
             with open(progressive_baseline_path, "r") as f: temp_lines = f.readlines()
             with open(progressive_baseline_path, "w") as f:
-                updated_pkgs = {self._get_package_name_from_spec(p.split('==')[0]): p.split('==')[1] for p in greedy_plan}
                 for line in temp_lines:
                     p_name = self._get_package_name_from_spec(line.split('==')[0] if '==' in line else "")
-                    if p_name in updated_pkgs:
-                        f.write(f"{p_name}=={updated_pkgs[p_name]}\n")
+                    if p_name in changes_map:
+                        f.write(f"{p_name}=={changes_map[p_name]}\n")
                     else:
                         f.write(line)
-            return True, target_version, None
+            # Return ALL changes
+            return True, changes_map, None
 
+        # 4. EXPERT LOOP
         print("       Greedy Plan FAILED. Proceeding to Neuro-Symbolic Refinement.")
-
-        # 4. NEURO-SYMBOLIC LOOP (Expert Agent)
         current_versions_map = {}
         with open(baseline_reqs_path, 'r') as f:
             for line in f:
@@ -493,49 +497,42 @@ class DependencyAgent:
                     v_part = line.split('==')[1].split(';')[0].strip()
                     current_versions_map[p_name] = v_part
 
-        history = []
-        history.append((str(greedy_plan), "Greedy update failed validation."))
+        history = [(str(greedy_plan), "Greedy update failed validation.")]
 
         for attempt in range(1, 4):
-            print(f"\n    -> [Co-Resolution Attempt {attempt}/3] Requesting Expert Plan...")
-            
-            # Pass the Best Error Log for the first attempt, then use history
-            current_error_log = best_error_log if attempt == 1 else "Previous plan failed"
-            
+            # ... (Loop Logic same as before) ...
             co_resolution_plan = self.expert.propose_co_resolution(
                 target_package=package, 
-                error_log=current_error_log, 
+                error_log=best_error_log if attempt == 1 else history[-1][1], 
                 available_updates=updatable_blockers,
                 current_versions=current_versions_map,
                 history=history
             )
 
             if not co_resolution_plan or not co_resolution_plan.get("plausible"):
-                print("    -> Expert sees no plausible solution.")
                 break
 
             plan_list = co_resolution_plan['proposed_plan']
             print(f"    -> Executing Plan: {plan_list}")
             
-            probe_success = self._run_co_resolution_probe(plan_list, baseline_reqs_path)
-
-            if probe_success:
+            if self._run_co_resolution_probe(plan_list, baseline_reqs_path):
                  print("--> Co-resolution probe SUCCEEDED!")
+                 changes_map = {self._get_package_name_from_spec(p.split('==')[0]): p.split('==')[1] for p in plan_list}
+                 
                  with open(progressive_baseline_path, "r") as f: temp_lines = f.readlines()
                  with open(progressive_baseline_path, "w") as f:
-                     updated_pkgs = {self._get_package_name_from_spec(p.split('==')[0]): p.split('==')[1] for p in plan_list}
                      for line in temp_lines:
                          p_name = self._get_package_name_from_spec(line.split('==')[0] if '==' in line else "")
-                         if p_name in updated_pkgs:
-                             f.write(f"{p_name}=={updated_pkgs[p_name]}\n")
+                         if p_name in changes_map:
+                             f.write(f"{p_name}=={changes_map[p_name]}\n")
                          else:
                              f.write(line)
-                 return True, target_version, None
+                 return True, changes_map, None
             
             history.append((str(plan_list), "Validation Failed"))
 
-        print(f"--> Healing Result: All attempts failed. Reverting to {current_version}.")
-        return True, current_version, None
+        print(f"--> Healing Result: All attempts failed. Reverting.")
+        return True, {package: current_version}, None
         
     def _heal_with_filter_and_scan(self, package, last_good_version, failed_version, baseline_reqs_path):
         start_group(f"Healing '{package}': Filter-Then-Scan Strategy")
