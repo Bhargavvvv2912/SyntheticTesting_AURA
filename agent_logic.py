@@ -660,7 +660,7 @@ class DependencyAgent:
         
         requirements_list.extend(proposed_plan)
         
-        # FIXED: Added --no-build-isolation
+        # Install dependencies
         pip_command_tools = [python_executable, "-m", "pip", "install", "--no-build-isolation"] + requirements_list
         _, stderr_install, returncode = run_command(pip_command_tools, cwd=project_dir)
         
@@ -671,14 +671,19 @@ class DependencyAgent:
             end_group()
             return False
 
-        print("\n--> Stage 2: Building and installing the project...")
-        # FIXED: Added --no-build-isolation
-        build_install_command = [python_executable, "-m", "pip", "install", "--no-build-isolation", f"./{project_dir}"]
-        _, stderr_build, returncode_build = run_command(build_install_command, cwd=project_dir)
-        if returncode_build != 0:
-            print("--> ERROR: Project build/install failed with the co-resolution set.")
-            end_group()
-            return False
+        # --- FIX: Only run Stage 2 if the project is installable ---
+        if self.config.get("IS_INSTALLABLE_PACKAGE", False):
+            print("\n--> Stage 2: Building and installing the project...")
+            project_extras = self.config.get("PROJECT_EXTRAS", "")
+            build_install_command = [python_executable, "-m", "pip", "install", "--no-build-isolation", f"./{project_dir}{project_extras}"]
+            _, stderr_build, returncode_build = run_command(build_install_command, cwd=project_dir)
+            if returncode_build != 0:
+                print("--> ERROR: Project build/install failed with the co-resolution set.")
+                end_group()
+                return False
+        else:
+            print("\n--> Stage 2: Skipped (Project is not an installable package).")
+        # -----------------------------------------------------------
 
         print("\n--> Stage 3: Running validation suite on the co-resolution set...")
         success, _, _ = validate_changes(python_executable, self.config, group_title="Validating Co-Resolution Plan")
